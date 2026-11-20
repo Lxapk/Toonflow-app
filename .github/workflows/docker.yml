@@ -169,6 +169,9 @@ jobs:
         with:
           context: src
           platforms: ${{ matrix.platform }}
+          # 版本号在构建时写入前后端产物，不传会显示为 electrobun.config.ts 的默认值 2.0.0。
+          build-args: |
+            appVersion=${{ needs.prepare.outputs.version }}
           # 按摘要推送，各架构互不覆盖；可读标签在 merge 任务合并清单时统一打上。
           outputs: type=image,name=${{ needs.prepare.outputs.image }},name-canonical=true,push-by-digest=true,push=true
           labels: ${{ needs.prepare.outputs.labels }}
