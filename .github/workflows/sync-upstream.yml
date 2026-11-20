@@ -1,0 +1,134 @@
+name: Sync upstream release
+
+# 定时检查上游正式版，发现新版本就触发镜像构建。
+# 本工作流不修改本仓库内容、不推送提交或标签，因此不会遇到 GITHUB_TOKEN
+# 无法推送 .github/workflows 文件的权限问题。
+
+on:
+  schedule:
+    # 每 6 小时检查一次；GitHub 的 cron 在高峰期可能延迟数十分钟。
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 即使该版本已构建过也重新构建
+        type: boolean
+        default: false
+      ref:
+        description: 指定要构建的上游版本，留空则用上游最新正式版
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  upstream: HBAI-Ltd/Toonflow-app
+
+jobs:
+  sync:
+    name: 检查上游版本并触发构建
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 确定目标版本
+        id: target
+        env:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ env.upstream }}
+          requested: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$requested" ]]; then
+            tag="$requested"
+            echo "使用手动指定的版本：$tag"
+          else
+            tag=$(curl -fsS -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+              "${GITHUB_API_URL}/repos/${repository}/releases/latest" \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(String(JSON.parse(s).tag_name??"")))')
+            echo "上游最新正式版：$tag"
+          fi
+          case "$tag" in
+            v[0-9]*) ;;
+            *)
+              echo "上游版本不是 vX.Y.Z 形式，跳过：$tag" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 判断该版本是否已构建
+        id: check
+        env:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          version: ${{ steps.target.outputs.version }}
+          force: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [[ "$force" == "true" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "手动指定强制重建，跳过已构建检查"
+            exit 0
+          fi
+          # 以 GHCR 中是否已有该版本镜像为准，标签存在但镜像缺失时仍会重建。
+          authorization=$(curl -fsS "https://ghcr.io/token?scope=repository:${repository,,}:pull&service=ghcr.io" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).token ?? ""))')
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $authorization" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            "https://ghcr.io/v2/${repository,,}/manifests/${version}")
+          if [[ "$code" == "200" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "镜像 ${version} 已存在，跳过构建"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "镜像 ${version} 尚未发布（HTTP $code），将触发构建"
+          fi
+
+      - name: 触发镜像构建
+        if: steps.check.outputs.skip == 'false'
+        env:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          version: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 用 workflow_dispatch 指定 ref 与版本。GITHUB_TOKEN 无法触发 repository_dispatch，
+          # 但可以调用同一仓库的其他工作流（需要 actions: write）。
+          body=$(node -e 'process.stdout.write(JSON.stringify({ref:"master",inputs:{ref:process.argv[1]}}))' "v${version#v}")
+          code=$(curl -s -o "$RUNNER_TEMP/out.txt" -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${repository}/actions/workflows/docker.yml/dispatches" \
+            -d "$body")
+          if [[ "$code" != "204" ]]; then
+            echo "触发失败（HTTP $code）：" >&2
+            cat "$RUNNER_TEMP/out.txt" >&2
+            exit 1
+          fi
+          echo "已触发构建：v${version#v}"
+
+      - name: 汇总
+        if: always()
+        env:
+          version: ${{ steps.target.outputs.version }}
+          skip: ${{ steps.check.outputs.skip }}
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "- 目标版本：\`${version:-未知}\`"
+            if [[ "$skip" == "true" ]]; then
+              echo "- 结论：镜像已存在，本次未重新构建"
+            else
+              echo "- 结论：已触发镜像构建（Publish Docker image）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

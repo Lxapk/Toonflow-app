@@ -1,0 +1,13 @@
+services:
+  toonflow:
+    image: ghcr.io/lxapk/toonflow-app:latest
+    container_name: toonflow
+    init: true
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - toonflowData:/app/data
+
+volumes:
+  toonflowData:

@@ -156,6 +156,53 @@ Toonflow 是面向短剧、漫剧和短视频创作者的开源 AI 创作工具�
 
 ---
 
+## 🐳 Docker 一键部署
+
+无需克隆源码、无需本地构建，复制下面的 `docker-compose.yml` 到设备上即可拉取并使用：
+
+```yaml
+services:
+  toonflow:
+    image: ghcr.io/lxapk/toonflow-app:latest
+    container_name: toonflow
+    init: true
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - toonflowData:/app/data
+
+volumes:
+  toonflowData:
+```
+
+在该文件所在目录执行部署：
+
+```sh
+docker compose up -d
+```
+
+启动后浏览器打开 `http://<设备IP>:3000`。首次启动会自动初始化内置插件，并生成 `myProject` 工作目录。
+
+| 项目 | 说明 |
+| --- | --- |
+| 镜像地址 | `ghcr.io/lxapk/toonflow-app`（public，无需 `docker login`） |
+| 支持架构 | `linux/amd64`、`linux/arm64`，Intel/AMD 与 ARM 设备均可 |
+| 标签策略 | `latest` 跟随上游最新正式版；也可固定版本，如 `ghcr.io/lxapk/toonflow-app:2.0.10` |
+| 数据目录 | 命名卷 `toonflowData` 挂载到 `/app/data`，含配置、插件与项目文件 |
+| 升级 | `docker compose pull && docker compose up -d`，数据自动保留 |
+
+- **飞牛 NAS / 群晖 / 威联通**：`Docker → Compose → 新建项目`，粘贴上面的内容即可构建运行；也可直接填镜像名 `ghcr.io/lxapk/toonflow-app:latest`、端口 `3000`、挂载路径 `/app/data`。
+- **备份**：先 `docker compose stop`，再 `docker compose cp toonflow:/app/data ./toonflowBackup`，完成后 `docker compose start`。
+- **注意**：请勿执行 `docker compose down -v`，该命令会删除数据卷。
+- **访问安全**：服务固定端口 3000，页面与 API 没有独立登录鉴权；仅局域网使用可保持默认，公网访问请在反向代理层加认证，或使用 SSH 隧道 `ssh -N -L 3000:127.0.0.1:3000 用户名@服务器地址`。
+
+> 拉取大层时若报 `connection reset by peer`，是因为镜像层托管在 `pkg-containers.githubusercontent.com`（Fastly CDN），部分网络下传输会被重置；重试通常可继续，也可为 Docker 配置可用的加速器或代理。
+
+源码构建、日志与更多运维命令见 [4.2 Docker 安装](#42-docker-安装)。
+
+---
+
 ## 1. 💛 赞助与支持
 
 感谢以下合作伙伴对 Toonflow 开源项目的支持。
@@ -336,18 +383,59 @@ sudo spctl --master-disable
 
 先安装 Git、[Docker Engine](https://docs.docker.com/engine/install/) 和 Docker Compose；Windows / macOS 可使用 Docker Desktop 的 Linux 容器模式。仓库提供 [Dockerfile](./Dockerfile)、[Compose 配置](./compose.yaml) 和 [构建排除规则](./.dockerignore)，基于 Bun 1.4.3 构建，镜像内包含 FFmpeg。
 
+#### 方式一：拉取预构建镜像（推荐，飞牛 NAS / 群晖 / 威联通等设备适用）
+
+仓库发布 `ghcr.io/lxapk/toonflow-app` 多架构镜像（`linux/amd64`、`linux/arm64`），由 [Sync upstream release](./.github/workflows/sync-upstream.yml) 自动跟进上游新版本、[Publish Docker image](./.github/workflows/docker.yml) 构建。无需克隆源码，也不需要本地 Docker 构建环境。
+
+在设备上新建 `docker-compose.yml`，内容如下：
+
+```yaml
+services:
+  toonflow:
+    image: ghcr.io/lxapk/toonflow-app:latest
+    container_name: toonflow
+    init: true
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - toonflowData:/app/data
+
+volumes:
+  toonflowData:
+```
+
+在该文件所在目录执行：
+
+```sh
+docker compose up -d
+```
+
+浏览器打开 `http://<设备IP>:3000`。首次启动会在数据卷中初始化内置插件，并生成 `myProject` 工作目录。
+
+- **飞牛 NAS**：`Docker → Compose → 新建项目`，把上面的内容粘贴进 compose 编辑框并构建；也可直接填镜像名 `ghcr.io/lxapk/toonflow-app:latest`、端口 `3000`、挂载路径 `/app/data`。
+- **升级**：`docker compose pull && docker compose up -d`，数据保留在 `toonflowData` 卷中。
+- **固定版本**：把镜像地址改成具体版本号，例如 `ghcr.io/lxapk/toonflow-app:2.0.10`；`latest` 跟随最近一次发布的上游正式版。
+- 容器包为 public，拉取无需 `docker login`。
+
+> 镜像层托管在 `pkg-containers.githubusercontent.com`（Fastly CDN），部分网络环境下传输大层会被重置并报 `connection reset by peer`；重试通常可继续，也可为 Docker 配置可用的加速器或代理。
+
+#### 方式二：从源码构建
+
 <details>
-<summary><strong>展开 Docker 安装步骤</strong></summary>
+<summary><strong>展开源码构建与运维步骤</strong></summary>
 
 克隆源码后，在仓库根目录执行：
 
 ```sh
-git clone https://github.com/HBAI-Ltd/Toonflow-app.git
+git clone https://github.com/Lxapk/Toonflow-app.git
 cd Toonflow-app
 docker compose up -d --build
 ```
 
 首次构建会安装依赖并编译内置节点、工具、Web 与 Server。启动后访问 `http://127.0.0.1:3000`；远程主机可按下方“访问与数据说明”通过 SSH 隧道访问。首次启动会初始化内置插件，并提供 `myProject` 工作目录。
+
+两种方式的数据卷与端口完全一致；方式一升级镜像时执行 `docker compose pull && docker compose up -d`，数据保留在 `toonflowData` 卷中。
 
 配置、插件和项目文件保存在 Docker 命名卷 `toonflowData` 中，挂载至容器的 `/app/data/`。卷的实际名称带有 Compose 项目前缀；停止或重建容器会保留数据，**请勿使用 `docker compose down -v`，该命令会删除数据卷**。
 
@@ -396,7 +484,7 @@ bun --version
 克隆源码并启动：
 
 ```sh
-git clone https://github.com/HBAI-Ltd/Toonflow-app.git
+git clone https://github.com/Lxapk/Toonflow-app.git
 cd Toonflow-app
 bun install --frozen-lockfile
 
