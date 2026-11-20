@@ -40,6 +40,8 @@ jobs:
       upstream_ref: ${{ steps.resolve.outputs.upstream_ref }}
       sha: ${{ steps.resolve.outputs.sha }}
       latest_tag: ${{ steps.resolve.outputs.latest_tag }}
+      build: ${{ steps.resolve.outputs.build }}
+      skip_reason: ${{ steps.resolve.outputs.skip_reason }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
     steps:
@@ -90,19 +92,67 @@ jobs:
           # 镜像 index 不带 version 注解，因此从包版本列表里找出哪个版本持有 latest 标签。
           latest_tag="true"
           current=$(curl -s -m 30 -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
-            "${GITHUB_API_URL}/users/${repository%%/*}/packages/container/${repository##*/}/versions?per_page=30" \
+            "${GITHUB_API_URL}/users/${repository%%/*}/packages/container/${repository##*/}/versions?per_page=50" \
             2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);const hit=(Array.isArray(j)?j:[]).find(v=>((v.metadata?.container?.tags)||[]).includes("latest"));const tags=hit?.metadata?.container?.tags||[];process.stdout.write(String(tags.find(t=>/^\d+\.\d+/.test(t))??""))}catch{process.stdout.write("")}})' 2>/dev/null || true)
+
+          # 只构建新版本，或版本号相同但上游提交已变的镜像。
+          # 比较基准是镜像 label 里的 commit SHA，而不是版本号本身，
+          # 这样上游重新指向同一个 tag 时也能重新构建。
+          build="true"
+          skip_reason=""
+
+          # 读取某个镜像标签记录的 revision（commit SHA）。
+          image_revision() {
+            local tag="$1"
+            local authz anon idx amd cfg rev
+            authz=$(curl -fsS "https://ghcr.io/token?scope=repository:${repository,,}:pull&service=ghcr.io" 2>/dev/null || true)
+            [ -z "$authz" ] && return 0
+            anon=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).token??""))}catch{process.stdout.write("")}})' <<< "$authz" 2>/dev/null || true)
+            [ -z "$anon" ] && return 0
+            idx=$(curl -s -m 20 -H "Authorization: Bearer $anon" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://ghcr.io/v2/${repository,,}/manifests/${tag}" 2>/dev/null || true)
+            # 单架构镜像没有 manifests 数组，直接取 config。
+            amd=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);const m=(j.manifests||[]).find(x=>(x.platform?.architecture||"amd64")==="amd64")||j;process.stdout.write(String(m.digest??""))}catch{process.stdout.write("")}})' <<< "$idx" 2>/dev/null || true)
+            [ -z "$amd" ] && return 0
+            cfg=$(curl -s -m 20 -H "Authorization: Bearer $anon" \
+              -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+              "https://ghcr.io/v2/${repository,,}/manifests/${amd}" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).config?.digest??""))}catch{process.stdout.write("")}})' 2>/dev/null || true)
+            [ -z "$cfg" ] && return 0
+            rev=$(curl -sL -m 30 -H "Authorization: Bearer $anon" \
+              "https://ghcr.io/v2/${repository,,}/blobs/${cfg}" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const l=JSON.parse(s).config?.Labels||{};process.stdout.write(String(l["org.opencontainers.image.revision"]??""))}catch{process.stdout.write("")}})' 2>/dev/null || true)
+            printf '%s' "$rev"
+          }
+
+          same_version_revision=$(image_revision "$version")
+
           if [[ -n "$current" ]]; then
             if [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" = "$version" ]; then
-              latest_tag="true"
-              echo "latest 当前为 $current，$version 不早于此版本，将更新 latest"
+              if [ "$current" = "$version" ]; then
+                # 同版本：比较提交 SHA，一致则不构建，不一致说明上游改过该 tag，需要重建。
+                if [[ -z "$same_version_revision" ]]; then
+                  echo "镜像 $version 不存在或读不到提交信息，将构建"
+                elif [[ -n "${sha:-}" && "$same_version_revision" = "$sha" ]]; then
+                  build="false"
+                  skip_reason="镜像 $version 已存在且提交一致（${sha}），无需重复构建"
+                else
+                  echo "镜像 $version 记录的提交为 ${same_version_revision}，上游现为 ${sha:-未知}，需要重建"
+                fi
+              else
+                echo "$version 高于当前 latest（$current），将构建并更新 latest"
+              fi
             else
-              latest_tag="false"
-              echo "latest 当前为 $current，$version 早于它，只发布版本标签，不移动 latest"
+              build="false"
+              skip_reason="$version 低于当前最新版本 $current，已跳过"
             fi
           else
             echo "未能读取当前 latest 版本，按首次发布处理并更新 latest"
           fi
+          if [[ "$build" != "true" ]]; then
+            latest_tag="false"
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=$skip_reason" >> "$GITHUB_OUTPUT"
           echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
           echo "上游版本：$upstream_ref（commit=${sha:-未知}），镜像标签：$version$([[ "$latest_tag" == "true" ]] && echo '、latest')"
 
@@ -127,6 +177,8 @@ jobs:
   build:
     name: 构建 ${{ matrix.platform }}
     needs: prepare
+    # 已存在或低于当前最新的版本直接跳过，不消耗构建额度。
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -236,6 +288,25 @@ jobs:
           name: digest-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/digest-${{ matrix.arch }}
           retention-days: 1
+
+  report:
+    name: 未构建说明
+    needs: prepare
+    if: needs.prepare.outputs.build != 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 输出跳过原因
+        env:
+          reason: ${{ needs.prepare.outputs.skip_reason }}
+          version: ${{ needs.prepare.outputs.version }}
+        run: |
+          echo "跳过构建：$reason"
+          {
+            echo "## 未构建"
+            echo ""
+            echo "- 目标版本：\`${version}\`"
+            echo "- 原因：$reason"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   merge:
     name: 合并多架构清单
