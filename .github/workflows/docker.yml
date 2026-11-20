@@ -39,6 +39,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       upstream_ref: ${{ steps.resolve.outputs.upstream_ref }}
       sha: ${{ steps.resolve.outputs.sha }}
+      latest_tag: ${{ steps.resolve.outputs.latest_tag }}
       tags: ${{ steps.meta.outputs.tags }}
       labels: ${{ steps.meta.outputs.labels }}
     steps:
@@ -84,7 +85,26 @@ jobs:
           echo "upstream_ref=$upstream_ref" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=${sha:-}" >> "$GITHUB_OUTPUT"
-          echo "上游版本：$upstream_ref（commit=${sha:-未知}），镜像标签：$version、latest"
+
+          # latest 只向前推进：先查当前带 latest 标签的版本，避免重建旧版本时把 latest 退回。
+          # 镜像 index 不带 version 注解，因此从包版本列表里找出哪个版本持有 latest 标签。
+          latest_tag="true"
+          current=$(curl -s -m 30 -H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/users/${repository%%/*}/packages/container/${repository##*/}/versions?per_page=30" \
+            2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);const hit=(Array.isArray(j)?j:[]).find(v=>((v.metadata?.container?.tags)||[]).includes("latest"));const tags=hit?.metadata?.container?.tags||[];process.stdout.write(String(tags.find(t=>/^\d+\.\d+/.test(t))??""))}catch{process.stdout.write("")}})' 2>/dev/null || true)
+          if [[ -n "$current" ]]; then
+            if [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" = "$version" ]; then
+              latest_tag="true"
+              echo "latest 当前为 $current，$version 不早于此版本，将更新 latest"
+            else
+              latest_tag="false"
+              echo "latest 当前为 $current，$version 早于它，只发布版本标签，不移动 latest"
+            fi
+          else
+            echo "未能读取当前 latest 版本，按首次发布处理并更新 latest"
+          fi
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "上游版本：$upstream_ref（commit=${sha:-未知}），镜像标签：$version$([[ "$latest_tag" == "true" ]] && echo '、latest')"
 
       - name: 生成镜像标签
         id: meta
@@ -95,7 +115,7 @@ jobs:
             latest=false
           tags: |
             type=raw,value=${{ steps.resolve.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ steps.resolve.outputs.latest_tag == 'true' }}
           labels: |
             org.opencontainers.image.title=Toonflow
             org.opencontainers.image.source=https://github.com/${{ env.upstream }}
