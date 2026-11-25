@@ -159,19 +159,36 @@
       writeText: writeTextFallback,
       read: function () { return Promise.reject(new Error("当前浏览器不支持读取剪贴板图片，请在 HTTPS 下使用")); },
       write: function (items) {
-        // 仅支持纯文本写入，图片写入在非安全上下文无法实现。
+        // 非安全上下文只能写纯文本；图片写入无法实现，明确拒绝而不是静默失败。
         for (var i = 0; i < items.length; i++) {
           var item = items[i];
-          if (item && typeof item.getType === "function") {
-            var blob = item.getType("text/plain");
-            if (blob) return blob.then(function (b) { return b.text(); }).then(writeTextFallback);
-          }
+          if (!item || typeof item.getType !== "function") continue;
+          var blob = item.getType("text/plain");
+          if (blob) return blob.then(function (b) { return b.text(); }).then(writeTextFallback);
+          return Promise.reject(new Error("当前浏览器在非 HTTPS 环境下无法写入图片到剪贴板"));
         }
         return Promise.reject(new Error("当前浏览器不支持写入该类型剪贴板内容"));
       }
     };
     try { Object.defineProperty(navigator, "clipboard", { value: clipboardPolyfill, configurable: true }); }
     catch (e) { /* 无法覆盖时保持缺失，业务侧已有容错 */ }
+  }
+
+  /* ---------- ClipboardItem ---------- */
+  // 非安全上下文不提供 ClipboardItem，但业务代码会 new ClipboardItem(...)。
+  // 这里提供可构造的占位实现，让写入路径进入 clipboard.write 后给出明确错误，
+  // 而不是抛出 ReferenceError 中断整个操作。
+  if (typeof window.ClipboardItem !== "function") {
+    var ClipboardItemShim = function (items) {
+      this._items = items || {};
+    };
+    ClipboardItemShim.prototype.getType = function (type) {
+      var value = this._items[type];
+      return value === undefined ? null : Promise.resolve(value);
+    };
+    ClipboardItemShim.supports = function () { return false; };
+    try { window.ClipboardItem = ClipboardItemShim; }
+    catch (e) { /* 保持缺失 */ }
   }
 
   /* ---------- navigator.mediaDevices ---------- */
