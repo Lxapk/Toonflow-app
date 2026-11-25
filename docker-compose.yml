@@ -1,0 +1,36 @@
+# Toonflow 纯净版部署配置（镜像内容与上游官方源码一致，未打任何补丁）
+#
+# ── 必须用 HTTPS 或 localhost 访问 ────────────────────────
+# Toonflow 依赖 crypto.randomUUID、crypto.subtle 等浏览器 API，
+# 这些 API 只在“安全上下文”中可用：
+#   - https:// 任意地址
+#   - http://localhost / http://127.0.0.1
+#
+# 用 http://<局域网IP>:3000 直接访问会报
+#   crypto.randomUUID is not a function
+# 页面无法启动，画布和节点也读不到。
+#
+# 推荐用 Lucky 反向代理并配置 HTTPS 证书，然后访问 https://你的域名。
+# 临时验证可在 NAS 本机打开 http://localhost:3000。
+#
+# ── 插件管理限制（上游默认行为）──────────────────────────
+# 安装技能 / 节点 / 扩展 / MCP 要求“本机访问”。
+# 经反向代理访问时会被拒绝，提示“请在桌面端或服务器本机安装”。
+# 需要安装插件时，用 NAS 本机浏览器或 SSH 隧道到 localhost 操作：
+#   ssh -N -L 3000:127.0.0.1:3000 用户@192.168.31.5
+
+services:
+  toonflow:
+    image: ghcr.io/lxapk/toonflow-app:latest
+    container_name: toonflow
+    init: true
+    restart: unless-stopped
+    ports:
+      # 需要被 Lucky 从局域网访问，因此绑定所有网卡；
+      # 请勿把该端口直接暴露到公网，务必在 Lucky 上配置访问认证。
+      - "3000:3000"
+    volumes:
+      - toonflowData:/app/data
+
+volumes:
+  toonflowData:
